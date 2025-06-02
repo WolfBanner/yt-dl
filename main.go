@@ -3,10 +3,12 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"embed"
 	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -25,7 +27,15 @@ import (
 const downloadDir = "downloads"
 
 /* -------------------------------------------------------------------------- */
-/*                                   types                                    */
+/*                           embed  de  plantillas y  JS                      */
+/* -------------------------------------------------------------------------- */
+
+//go:embed templates/index.html
+//go:embed static/*
+var embeddedFS embed.FS
+
+/* -------------------------------------------------------------------------- */
+/*                                 tipos / estado                             */
 /* -------------------------------------------------------------------------- */
 
 type jobInfo struct {
@@ -46,19 +56,12 @@ type infoResp struct {
 	SubLangs       []string `json:"sub_langs"`
 }
 
-/* -------------------------------------------------------------------------- */
-/*                              globals & tmpl                                */
-/* -------------------------------------------------------------------------- */
-
 var (
 	jobs   = make(map[string]*jobInfo)
 	jobsMu sync.RWMutex
-	tmpl   = template.Must(template.ParseFiles("templates/index.html"))
 )
 
-/* -------------------------------------------------------------------------- */
-/*                                  helpers                                   */
-/* -------------------------------------------------------------------------- */
+/* --------------------------- helpers de estado ---------------------------- */
 
 func setJobPercent(id string, p int) {
 	jobsMu.Lock()
@@ -93,15 +96,14 @@ func finishJob(id, path string, err error) {
 }
 
 /* -------------------------------------------------------------------------- */
-/*                                   routes                                   */
+/*                                   rutas                                    */
 /* -------------------------------------------------------------------------- */
 
 func root(c *gin.Context) {
-	c.Header("Content-Type", "text/html; charset=utf-8")
-	_ = tmpl.Execute(c.Writer, nil)
+	c.HTML(http.StatusOK, "index.html", nil)
 }
 
-/* ----------------------------- /info  POST -------------------------------- */
+/* ----------------------------  /info (POST) ------------------------------- */
 
 func getInfo(c *gin.Context) {
 	url := c.PostForm("url")
@@ -120,12 +122,16 @@ func getInfo(c *gin.Context) {
 	}
 	args = append(args, url)
 
-	out, err := exec.Command("yt-dlp", args...).Output()
+	/* combinedOutput → stderr + stdout */
+	out, err := exec.Command("yt-dlp", args...).CombinedOutput()
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		/* adjuntamos texto completo para que el frontend lo muestre */
+		c.JSON(http.StatusBadRequest,
+			gin.H{"error": fmt.Sprintf("%v – %s", err, bytes.TrimSpace(out))})
 		return
 	}
 
+	/* … parseo JSON (sin cambios) … */
 	var yt struct {
 		Title      string `json:"title"`
 		Thumbnail  string `json:"thumbnail"`
@@ -176,14 +182,15 @@ func getInfo(c *gin.Context) {
 
 	resp := infoResp{Title: yt.Title, ThumbURL: thumb, SubLangs: langs}
 	for _, h := range videoQ {
-		resp.VideoQualities = append(resp.VideoQualities, fmt.Sprintf("%d", h))
+		resp.VideoQualities =
+			append(resp.VideoQualities, fmt.Sprintf("%d", h))
 	}
 	resp.AudioQualities = audioQ
 
 	c.JSON(http.StatusOK, resp)
 }
 
-/* --------------------------- /download POST ------------------------------- */
+/* ---------------------------  /download POST ------------------------------ */
 
 func startDownload(c *gin.Context) {
 	url := c.PostForm("url")
@@ -209,7 +216,7 @@ func startDownload(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"job": id})
 }
 
-/* --------------------------- /cancel POST --------------------------------- */
+/* ---------------------------  /cancel POST -------------------------------- */
 
 func cancelDownload(c *gin.Context) {
 	id := c.Param("id")
@@ -226,7 +233,7 @@ func cancelDownload(c *gin.Context) {
 	c.JSON(http.StatusNotFound, gin.H{"error": "job no encontrado"})
 }
 
-/* --------------------------- /progress SSE -------------------------------- */
+/* ---------------------------  /progress SSE ------------------------------ */
 
 func progress(c *gin.Context) {
 	id := c.Param("id")
@@ -278,7 +285,7 @@ func progress(c *gin.Context) {
 	}
 }
 
-/* --------------------------- /download GET -------------------------------- */
+/* ---------------------------  /download GET ------------------------------- */
 
 func serveFile(c *gin.Context) {
 	id := c.Param("id")
@@ -293,7 +300,7 @@ func serveFile(c *gin.Context) {
 }
 
 /* -------------------------------------------------------------------------- */
-/*                                   worker                                   */
+/*                                    worker                                  */
 /* -------------------------------------------------------------------------- */
 
 var (
@@ -302,8 +309,8 @@ var (
 )
 
 func downloadJob(id, url, cookies, media, quality, subLang string) {
-	destDir := filepath.Join(downloadDir, id)
-	_ = os.MkdirAll(destDir, 0755)
+	dest := filepath.Join(downloadDir, id)
+	_ = os.MkdirAll(dest, 0755)
 
 	nameTmpl := "%(title)s_%(resolution)s.%(ext)s"
 	switch media {
@@ -314,7 +321,7 @@ func downloadJob(id, url, cookies, media, quality, subLang string) {
 	case "thumb":
 		nameTmpl = "%(title)s_thumb.%(ext)s"
 	}
-	outPath := filepath.Join(destDir, nameTmpl)
+	outPath := filepath.Join(dest, nameTmpl)
 
 	args := []string{
 		"--newline",
@@ -333,13 +340,13 @@ func downloadJob(id, url, cookies, media, quality, subLang string) {
 		if subLang == "" {
 			subLang = "en"
 		}
-		args = append(args, "--skip-download", "--write-sub",
-			"--sub-lang", subLang, "--sub-format", "srt", "--convert-subs", "srt")
+		args = append(args, "--skip-download", "--write-sub", "--sub-lang", subLang,
+			"--sub-format", "srt", "--convert-subs", "srt")
 		setJobStage(id, "Descargando subtítulos…")
 	case "thumb":
 		args = append(args, "--skip-download", "--write-thumbnail")
 		setJobStage(id, "Descargando miniatura…")
-	default: // video
+	default: // vídeo
 		format := "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
 		if quality != "" {
 			format = fmt.Sprintf(
@@ -351,7 +358,7 @@ func downloadJob(id, url, cookies, media, quality, subLang string) {
 	}
 
 	if cookies != "" {
-		tmp := filepath.Join(destDir, "cookies.json")
+		tmp := filepath.Join(dest, "cookies.json")
 		_ = os.WriteFile(tmp, []byte(cookies), 0600)
 		args = append(args, "--cookies", tmp)
 	}
@@ -366,7 +373,6 @@ func downloadJob(id, url, cookies, media, quality, subLang string) {
 
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
-
 	if err := cmd.Start(); err != nil {
 		finishJob(id, "", err)
 		return
@@ -376,21 +382,21 @@ func downloadJob(id, url, cookies, media, quality, subLang string) {
 	go parseProgress(id, stderr)
 
 	if err := cmd.Wait(); err != nil {
-		errBuf, _ := io.ReadAll(stderr)
-		finishJob(id, "", fmt.Errorf("%v – %s", err, string(errBuf)))
+		out, _ := io.ReadAll(stderr)
+		finishJob(id, "", fmt.Errorf("%v – %s", err, bytes.TrimSpace(out)))
 		return
 	}
 
 	/* localizar MP4 final */
 	var final string
-	_ = filepath.WalkDir(destDir, func(p string, d os.DirEntry, _ error) error {
+	filepath.WalkDir(dest, func(p string, d os.DirEntry, _ error) error {
 		if !d.IsDir() && filepath.Ext(p) == ".mp4" {
 			final = p
 		}
 		return nil
 	})
 
-	/* asegurar que el archivo no crece más */
+	/* asegurar que no crece */
 	if final != "" {
 		info1, _ := os.Stat(final)
 		time.Sleep(500 * time.Millisecond)
@@ -399,24 +405,22 @@ func downloadJob(id, url, cookies, media, quality, subLang string) {
 			time.Sleep(500 * time.Millisecond)
 		}
 	}
-
 	finishJob(id, final, nil)
 }
 
-/* -------------------------- parseProgress ---------------------------------- */
+/* ------------------------------ progreso ---------------------------------- */
 
 func parseProgress(id string, r io.Reader) {
 	rd := bufio.NewReader(r)
 	for {
 		line, err := rd.ReadString('\n')
 
-		/* detectar destino y cambiar fase */
 		if m := destRe.FindStringSubmatch(line); len(m) == 2 {
 			ext := m[1]
 			switch ext {
 			case "mp4", "webm":
 				setJobStage(id, "Descargando vídeo…")
-			case "m4a", "mp3", "webm-opus":
+			case "m4a", "mp3", "opus":
 				setJobStage(id, "Descargando audio…")
 			}
 		}
@@ -425,7 +429,6 @@ func parseProgress(id string, r io.Reader) {
 			setJobStage(id, "Combinando (FFmpeg)…")
 		}
 
-		/* porcentaje */
 		if m := progressRe.FindSubmatch([]byte(line)); len(m) == 2 {
 			if pct, e := strconv.ParseFloat(string(m[1]), 64); e == nil {
 				setJobPercent(id, int(pct))
@@ -442,12 +445,15 @@ func parseProgress(id string, r io.Reader) {
 /* -------------------------------------------------------------------------- */
 
 func main() {
-	if err := os.MkdirAll(downloadDir, 0755); err != nil {
-		log.Fatal(err)
-	}
-
 	r := gin.Default()
-	r.Static("/static", "./static")
+
+	// plantilla
+	tpl := template.Must(template.ParseFS(embeddedFS, "templates/index.html"))
+	r.SetHTMLTemplate(tpl)
+
+	// static
+	subFS, _ := fs.Sub(embeddedFS, "static")
+	r.StaticFS("/static", http.FS(subFS))
 
 	r.GET("/", root)
 	r.POST("/info", getInfo)
@@ -456,6 +462,6 @@ func main() {
 	r.GET("/progress/:id", progress)
 	r.GET("/download/:id", serveFile)
 
-	log.Println("Servidor en http://localhost:8080")
+	log.Println("http://localhost:8080")
 	r.Run(":8080")
 }
