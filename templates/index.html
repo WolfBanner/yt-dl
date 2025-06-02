@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>YouTube Downloader</title>
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css"
+    />
+    <style>
+      #progressBar {
+        width: 100%;
+        height: 1rem;
+        background: #eee;
+        border-radius: 0.5rem;
+      }
+      #progress {
+        height: 100%;
+        width: 0;
+        background: mediumseagreen;
+        border-radius: 0.5rem;
+        transition: width 0.2s;
+      }
+      .hidden {
+        display: none;
+      }
+      #thumbPreview {
+        max-width: 100%;
+        margin-top: 1rem;
+      }
+      dialog {
+        max-width: 500px;
+      }
+      /* Toast */
+      .toast {
+        position: fixed;
+        right: 1rem;
+        bottom: 1rem;
+        padding: 0.6rem 1rem;
+        border-radius: 0.5rem;
+        color: #fff;
+        font-weight: 600;
+        opacity: 0.9;
+        z-index: 999;
+        animation: fadeout 3.5s forwards;
+      }
+      .toast.success {
+        background: mediumseagreen;
+      }
+      .toast.error {
+        background: #e63946;
+      }
+      @keyframes fadeout {
+        0% {
+          opacity: 0.9;
+        }
+        80% {
+          opacity: 0.9;
+        }
+        100% {
+          opacity: 0;
+          transform: translateY(20px);
+        }
+      }
+    </style>
+  </head>
+  <body class="container">
+    <header
+      style="display: flex; justify-content: space-between; align-items: center"
+    >
+      <h3 style="margin: 0">YT Downloader</h3>
+      <button id="settingsBtn" aria-label="Configuración">
+        ⚙ Configuración
+      </button>
+    </header>
+
+    <article>
+      <label
+        >Enlace
+        <input
+          id="urlInput"
+          type="url"
+          placeholder="https://www.youtube.com/watch?v=..."
+          required
+        />
+      </label>
+      <button type="button" id="infoBtn">Obtener info</button>
+
+      <label
+        >Tipo
+        <select id="typeSelect">
+          <option value="video">Video</option>
+          <option value="audio">Audio (MP3)</option>
+          <option value="subs">Subtítulos</option>
+          <option value="thumb">Miniatura</option>
+        </select>
+      </label>
+
+      <label id="qualityRow"
+        >Calidad
+        <select id="qualitySelect">
+          <option value="">Auto</option>
+        </select>
+      </label>
+
+      <label id="langRow" class="hidden"
+        >Idioma subs
+        <select id="langSelect">
+          <option value="en">en</option>
+        </select>
+      </label>
+
+      <button id="actionBtn">Descargar</button>
+
+      <div id="progressContainer" class="hidden">
+        <p>Progreso: <span id="stageText"></span></p>
+        <div id="progressBar"><div id="progress"></div></div>
+      </div>
+
+      <img id="thumbPreview" class="hidden" alt="preview" />
+      <p id="result"></p>
+    </article>
+
+    <!-- Configuración -->
+    <dialog id="settingsDialog">
+      <article>
+        <header><h3>⚙ Configuración</h3></header>
+        <label
+          >Cookies JSON de YouTube
+          <textarea
+            id="cookiesArea"
+            rows="6"
+            placeholder='[ { "domain":".youtube.com", ... } ]'
+          ></textarea>
+        </label>
+        <footer style="display: flex; justify-content: flex-end; gap: 0.5rem">
+          <button id="clearCookies" class="secondary">Limpiar cookies</button>
+          <button id="closeSettings">Cerrar</button>
+        </footer>
+      </article>
+    </dialog>
+
+    <script src="/static/main.js"></script>
+  </body>
+</html>
