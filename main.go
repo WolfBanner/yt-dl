@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,7 +28,7 @@ import (
 const downloadDir = "downloads"
 
 /* -------------------------------------------------------------------------- */
-/*                           embed  de  plantillas y  JS                      */
+/*                    archivos embebidos (HTML + JS + CSS)                    */
 /* -------------------------------------------------------------------------- */
 
 //go:embed templates/index.html
@@ -35,7 +36,7 @@ const downloadDir = "downloads"
 var embeddedFS embed.FS
 
 /* -------------------------------------------------------------------------- */
-/*                                 tipos / estado                             */
+/*                              tipos y estado                                */
 /* -------------------------------------------------------------------------- */
 
 type jobInfo struct {
@@ -61,7 +62,9 @@ var (
 	jobsMu sync.RWMutex
 )
 
-/* --------------------------- helpers de estado ---------------------------- */
+/* -------------------------------------------------------------------------- */
+/*                              helpers de estado                             */
+/* -------------------------------------------------------------------------- */
 
 func setJobPercent(id string, p int) {
 	jobsMu.Lock()
@@ -96,14 +99,72 @@ func finishJob(id, path string, err error) {
 }
 
 /* -------------------------------------------------------------------------- */
-/*                                   rutas                                    */
+/*                   cookies: JSON → Netscape conversión                      */
 /* -------------------------------------------------------------------------- */
 
-func root(c *gin.Context) {
-	c.HTML(http.StatusOK, "index.html", nil)
+type chromeCookie struct {
+	Domain string  `json:"domain"`
+	Name   string  `json:"name"`
+	Value  string  `json:"value"`
+	Path   string  `json:"path"`
+	Secure bool    `json:"secure"`
+	Expiry float64 `json:"expirationDate"`
 }
 
-/* ----------------------------  /info (POST) ------------------------------- */
+func jsonToNetscape(js string) (string, error) {
+	var arr []chromeCookie
+	if err := json.Unmarshal([]byte(js), &arr); err != nil {
+		return "", err
+	}
+
+	var b strings.Builder
+	b.WriteString("# Netscape HTTP Cookie File\n")
+	for _, c := range arr {
+		hostOnly := "FALSE"
+		if strings.HasPrefix(c.Domain, ".") {
+			hostOnly = "TRUE"
+		}
+		secure := "FALSE"
+		if c.Secure {
+			secure = "TRUE"
+		}
+		exp := int64(c.Expiry + 0.5) // redondeo
+		fmt.Fprintf(&b, "%s\t%s\t%s\t%s\t%d\t%s\t%s\n",
+			c.Domain, hostOnly, c.Path, secure, exp, c.Name, c.Value)
+	}
+	return b.String(), nil
+}
+
+/* crea archivo tmp con cookies (json o netscape) y devuelve ruta + cleanup */
+func prepareCookieFile(raw string, workDir string) (string, func(), error) {
+	if raw == "" {
+		return "", func() {}, nil
+	}
+	// heurística: JSON empieza con '['
+	var txt string
+	if strings.HasPrefix(strings.TrimSpace(raw), "[") {
+		var err error
+		txt, err = jsonToNetscape(raw)
+		if err != nil {
+			return "", nil, err
+		}
+	} else {
+		txt = raw
+	}
+	tmp := filepath.Join(workDir, "cookies.txt")
+	if err := os.WriteFile(tmp, []byte(txt), 0600); err != nil {
+		return "", nil, err
+	}
+	return tmp, func() { os.Remove(tmp) }, nil
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                  rutas                                     */
+/* -------------------------------------------------------------------------- */
+
+func root(c *gin.Context) { c.HTML(http.StatusOK, "index.html", nil) }
+
+/* --------------------------- /info  POST ---------------------------------- */
 
 func getInfo(c *gin.Context) {
 	url := c.PostForm("url")
@@ -111,36 +172,40 @@ func getInfo(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "url requerida"})
 		return
 	}
-	cookies := c.PostForm("cookies")
+	rawCookies := c.PostForm("cookies")
+
+	tmpDir, _ := os.MkdirTemp("", "ytinfo_")
+	defer os.RemoveAll(tmpDir)
+
+	cookieFile, clean, err := prepareCookieFile(rawCookies, tmpDir)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	defer clean()
 
 	args := []string{"-J", "--no-warnings", "--skip-download"}
-	if cookies != "" {
-		tmp, _ := os.CreateTemp("", "ytcookies_*.json")
-		_ = os.WriteFile(tmp.Name(), []byte(cookies), 0600)
-		args = append(args, "--cookies", tmp.Name())
-		defer os.Remove(tmp.Name())
+	if cookieFile != "" {
+		args = append(args, "--cookies", cookieFile)
 	}
 	args = append(args, url)
 
-	/* combinedOutput → stderr + stdout */
 	out, err := exec.Command("yt-dlp", args...).CombinedOutput()
 	if err != nil {
-		/* adjuntamos texto completo para que el frontend lo muestre */
 		c.JSON(http.StatusBadRequest,
 			gin.H{"error": fmt.Sprintf("%v – %s", err, bytes.TrimSpace(out))})
 		return
 	}
 
-	/* … parseo JSON (sin cambios) … */
+	/* parse JSON de yt-dlp (igual que antes) */
 	var yt struct {
 		Title      string `json:"title"`
 		Thumbnail  string `json:"thumbnail"`
 		Thumbnails []struct{ URL string }
 		Formats    []struct {
-			Vcodec string  `json:"vcodec"`
-			Acodec string  `json:"acodec"`
-			Height int     `json:"height"`
-			Abr    float64 `json:"abr"`
+			Vcodec, Acodec string
+			Height         int
+			Abr            float64
 		}
 		Subtitles map[string][]any `json:"subtitles"`
 	}
@@ -149,26 +214,25 @@ func getInfo(c *gin.Context) {
 		return
 	}
 
-	vSet, aSet := map[int]struct{}{}, map[string]struct{}{}
+	vset, aset := map[int]struct{}{}, map[string]struct{}{}
 	for _, f := range yt.Formats {
 		if f.Vcodec != "none" && f.Height > 0 {
-			vSet[f.Height] = struct{}{}
-		} else if f.Acodec != "none" && f.Vcodec == "none" && f.Abr > 0 {
-			aSet[fmt.Sprintf("%.0f", f.Abr)] = struct{}{}
+			vset[f.Height] = struct{}{}
+		}
+		if f.Acodec != "none" && f.Vcodec == "none" && f.Abr > 0 {
+			aset[fmt.Sprintf("%.0f", f.Abr)] = struct{}{}
 		}
 	}
-	videoQ := make([]int, 0, len(vSet))
-	for h := range vSet {
+	videoQ := make([]int, 0, len(vset))
+	for h := range vset {
 		videoQ = append(videoQ, h)
 	}
 	sort.Sort(sort.Reverse(sort.IntSlice(videoQ)))
-
-	audioQ := make([]string, 0, len(aSet))
-	for a := range aSet {
+	audioQ := make([]string, 0, len(aset))
+	for a := range aset {
 		audioQ = append(audioQ, a)
 	}
 	sort.Strings(audioQ)
-
 	langs := make([]string, 0, len(yt.Subtitles))
 	for l := range yt.Subtitles {
 		langs = append(langs, l)
@@ -182,15 +246,13 @@ func getInfo(c *gin.Context) {
 
 	resp := infoResp{Title: yt.Title, ThumbURL: thumb, SubLangs: langs}
 	for _, h := range videoQ {
-		resp.VideoQualities =
-			append(resp.VideoQualities, fmt.Sprintf("%d", h))
+		resp.VideoQualities = append(resp.VideoQualities, fmt.Sprintf("%d", h))
 	}
 	resp.AudioQualities = audioQ
-
 	c.JSON(http.StatusOK, resp)
 }
 
-/* ---------------------------  /download POST ------------------------------ */
+/* --------------------------- /download POST ------------------------------ */
 
 func startDownload(c *gin.Context) {
 	url := c.PostForm("url")
@@ -207,7 +269,7 @@ func startDownload(c *gin.Context) {
 	go downloadJob(
 		id,
 		url,
-		c.PostForm("cookies"),
+		c.PostForm("cookies"), // ← único campo
 		c.DefaultPostForm("type", "video"),
 		c.PostForm("quality"),
 		c.PostForm("sub_lang"),
@@ -308,10 +370,12 @@ var (
 	destRe     = regexp.MustCompile(`Destination: .*\.([a-z0-9]+)`)
 )
 
-func downloadJob(id, url, cookies, media, quality, subLang string) {
+func downloadJob(id, url, rawCookies, media, quality, subLang string) {
+	/* -------- carpeta de trabajo -------- */
 	dest := filepath.Join(downloadDir, id)
 	_ = os.MkdirAll(dest, 0755)
 
+	/* nombre de salida legible */
 	nameTmpl := "%(title)s_%(resolution)s.%(ext)s"
 	switch media {
 	case "audio":
@@ -323,12 +387,14 @@ func downloadJob(id, url, cookies, media, quality, subLang string) {
 	}
 	outPath := filepath.Join(dest, nameTmpl)
 
+	/* argumentos base */
 	args := []string{
 		"--newline",
 		"--progress-template", "download:%(progress._percent_str)s",
 		"-o", outPath,
 	}
 
+	/* flags según tipo */
 	switch media {
 	case "audio":
 		args = append(args, "-f", "bestaudio", "-x", "--audio-format", "mp3")
@@ -336,17 +402,21 @@ func downloadJob(id, url, cookies, media, quality, subLang string) {
 		if quality != "" {
 			args = append(args, "--audio-quality", quality)
 		}
+
 	case "subs":
 		if subLang == "" {
 			subLang = "en"
 		}
-		args = append(args, "--skip-download", "--write-sub", "--sub-lang", subLang,
-			"--sub-format", "srt", "--convert-subs", "srt")
+		args = append(args,
+			"--skip-download", "--write-sub",
+			"--sub-lang", subLang, "--sub-format", "srt", "--convert-subs", "srt")
 		setJobStage(id, "Descargando subtítulos…")
+
 	case "thumb":
 		args = append(args, "--skip-download", "--write-thumbnail")
 		setJobStage(id, "Descargando miniatura…")
-	default: // vídeo
+
+	default: // video
 		format := "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
 		if quality != "" {
 			format = fmt.Sprintf(
@@ -354,17 +424,25 @@ func downloadJob(id, url, cookies, media, quality, subLang string) {
 					"/best[ext=mp4][height<=%s]/best", quality, quality)
 		}
 		args = append(args, "-f", format, "--merge-output-format", "mp4")
-		setJobStage(id, "Descargando vídeo…")
+		setJobStage(id, "Descargando video…")
 	}
 
-	if cookies != "" {
-		tmp := filepath.Join(dest, "cookies.json")
-		_ = os.WriteFile(tmp, []byte(cookies), 0600)
-		args = append(args, "--cookies", tmp)
+	/* ---------- cookies (JSON o Netscape) ---------- */
+	if rawCookies != "" {
+		cookieFile, _, err := prepareCookieFile(rawCookies, dest)
+		if err != nil {
+			finishJob(id, "", fmt.Errorf("cookies: %v", err))
+			return
+		}
+		args = append(args, "--cookies", cookieFile)
 	}
+
 	args = append(args, url)
 
+	/* lanzar yt-dlp */
 	cmd := exec.Command("yt-dlp", args...)
+
+	// guardar cmd para poder cancelar
 	jobsMu.Lock()
 	if j, ok := jobs[id]; ok {
 		j.Cmd = cmd
@@ -373,6 +451,7 @@ func downloadJob(id, url, cookies, media, quality, subLang string) {
 
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
+
 	if err := cmd.Start(); err != nil {
 		finishJob(id, "", err)
 		return
@@ -382,12 +461,12 @@ func downloadJob(id, url, cookies, media, quality, subLang string) {
 	go parseProgress(id, stderr)
 
 	if err := cmd.Wait(); err != nil {
-		out, _ := io.ReadAll(stderr)
-		finishJob(id, "", fmt.Errorf("%v – %s", err, bytes.TrimSpace(out)))
+		buf, _ := io.ReadAll(stderr)
+		finishJob(id, "", fmt.Errorf("%v – %s", err, bytes.TrimSpace(buf)))
 		return
 	}
 
-	/* localizar MP4 final */
+	/* localizar el .mp4 final */
 	var final string
 	filepath.WalkDir(dest, func(p string, d os.DirEntry, _ error) error {
 		if !d.IsDir() && filepath.Ext(p) == ".mp4" {
@@ -396,15 +475,16 @@ func downloadJob(id, url, cookies, media, quality, subLang string) {
 		return nil
 	})
 
-	/* asegurar que no crece */
+	/* asegurarse de que ya no crece */
 	if final != "" {
-		info1, _ := os.Stat(final)
+		s1, _ := os.Stat(final)
 		time.Sleep(500 * time.Millisecond)
-		info2, _ := os.Stat(final)
-		if info1 != nil && info2 != nil && info1.Size() != info2.Size() {
+		s2, _ := os.Stat(final)
+		if s1 != nil && s2 != nil && s1.Size() != s2.Size() {
 			time.Sleep(500 * time.Millisecond)
 		}
 	}
+
 	finishJob(id, final, nil)
 }
 
@@ -419,7 +499,7 @@ func parseProgress(id string, r io.Reader) {
 			ext := m[1]
 			switch ext {
 			case "mp4", "webm":
-				setJobStage(id, "Descargando vídeo…")
+				setJobStage(id, "Descargando video…")
 			case "m4a", "mp3", "opus":
 				setJobStage(id, "Descargando audio…")
 			}
@@ -447,13 +527,13 @@ func parseProgress(id string, r io.Reader) {
 func main() {
 	r := gin.Default()
 
-	// plantilla
+	// template
 	tpl := template.Must(template.ParseFS(embeddedFS, "templates/index.html"))
 	r.SetHTMLTemplate(tpl)
 
 	// static
-	subFS, _ := fs.Sub(embeddedFS, "static")
-	r.StaticFS("/static", http.FS(subFS))
+	sub, _ := fs.Sub(embeddedFS, "static")
+	r.StaticFS("/static", http.FS(sub))
 
 	r.GET("/", root)
 	r.POST("/info", getInfo)
