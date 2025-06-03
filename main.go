@@ -166,7 +166,7 @@ func root(c *gin.Context) { c.HTML(http.StatusOK, "index.html", nil) }
 
 /* --------------------------- /info  POST ---------------------------------- */
 
-func getInfo(c *gin.Context) {
+func getInfoGin(c *gin.Context) {
 	url := c.PostForm("url")
 	if url == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "url requerida"})
@@ -254,7 +254,7 @@ func getInfo(c *gin.Context) {
 
 /* --------------------------- /download POST ------------------------------ */
 
-func startDownload(c *gin.Context) {
+func startDownloadGin(c *gin.Context) {
 	url := c.PostForm("url")
 	if url == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "URL requerida"})
@@ -280,7 +280,7 @@ func startDownload(c *gin.Context) {
 
 /* ---------------------------  /cancel POST -------------------------------- */
 
-func cancelDownload(c *gin.Context) {
+func cancelDownloadGin(c *gin.Context) {
 	id := c.Param("id")
 	jobsMu.Lock()
 	defer jobsMu.Unlock()
@@ -297,7 +297,7 @@ func cancelDownload(c *gin.Context) {
 
 /* ---------------------------  /progress SSE ------------------------------ */
 
-func progress(c *gin.Context) {
+func progressGin(c *gin.Context) {
 	id := c.Param("id")
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
@@ -349,7 +349,7 @@ func progress(c *gin.Context) {
 
 /* ---------------------------  /download GET ------------------------------- */
 
-func serveFile(c *gin.Context) {
+func serveFileGin(c *gin.Context) {
 	id := c.Param("id")
 	jobsMu.RLock()
 	job, ok := jobs[id]
@@ -524,7 +524,7 @@ func parseProgress(id string, r io.Reader) {
 /*                                    main                                    */
 /* -------------------------------------------------------------------------- */
 
-func main() {
+func runGinServer() {
 	r := gin.Default()
 
 	// template
@@ -536,11 +536,11 @@ func main() {
 	r.StaticFS("/static", http.FS(sub))
 
 	r.GET("/", root)
-	r.POST("/info", getInfo)
-	r.POST("/download", startDownload)
-	r.POST("/cancel/:id", cancelDownload)
-	r.GET("/progress/:id", progress)
-	r.GET("/download/:id", serveFile)
+	r.POST("/info", getInfoGin)
+	r.POST("/download", startDownloadGin)
+	r.POST("/cancel/:id", cancelDownloadGin)
+	r.GET("/progress/:id", progressGin)
+	r.GET("/download/:id", serveFileGin)
 
 	log.Println("http://localhost:8080")
 	r.Run(":8080")
