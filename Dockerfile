@@ -1,5 +1,5 @@
 # Stage 1: Build the Go application
-FROM golang:1.22-alpine AS builder
+FROM golang:latest AS builder
 
 WORKDIR /app
 
@@ -31,4 +31,4 @@ COPY --from=builder /app/yt_dl .
 EXPOSE 9191
 
 # Command to run the application when the container starts
-CMD ["./yt_dl"]
+CMD ["/yt_dl"]
