@@ -524,7 +524,7 @@ func parseProgress(id string, r io.Reader) {
 /*                                    main                                    */
 /* -------------------------------------------------------------------------- */
 
-func runGinServer() {
+func main() {
 	r := gin.Default()
 
 	// template
