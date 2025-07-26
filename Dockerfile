@@ -1,34 +1,71 @@
-# Stage 1: Build the Go application
-FROM golang:1.24.2-alpine AS builder
+# syntax=docker/dockerfile:1.6
+#############################
+# 1️⃣Stagede compilación  #
+#############################
+FROM --platform=$BUILDPLATFORM golang:1.24.2-alpine AS builder
 
-WORKDIR /app
+# ‑‑ ARGs útiles para embebido de metadatos
+ARG TARGETOS
+ARG TARGETARCH
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG BUILD_DATE
 
-# Copy go.mod and go.sum first to leverage Docker's caching
+# Dependencias mínimas para go get privado & certificados
+RUN apk add --no-cache git ca-certificates
+
+WORKDIR /src
+
+# 1. Descarga de dependencias (usa caché)
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 
-# Copy the rest of the application source code
+# 2. Copia del código y assets
 COPY . .
 
-# Build the Go application
-# CGO_ENABLED=0 disables CGO, creating a statically linked binary for better portability
-# GOOS=linux ensures the binary is built for a Linux environment
-# -a -ldflags='-s -w' reduces the binary size by stripping debug info and symbol table
-RUN CGO_ENABLED=0 GOOS=linux go build -a -ldflags='-s -w' -o yt_dl ./main.go #Adjust path to your main entry point
+## 3. (Opcional) ejecuta tests en el mismo contenedor
+#RUN --mount=type=cache,target=/root/.cache/go-build \
+#    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+#    go test ./...
 
-# Stage 2: Create the final lean image
-FROM alpine:latest
+# 4. Compila binario estático, embebiendo metadatos
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -trimpath \
+            -ldflags "-s -w \
+                      -X 'main.version=${VERSION}' \
+                      -X 'main.commit=${COMMIT}' \
+                      -X 'main.date=${BUILD_DATE}'" \
+            -o /out/yt-dl ./main.go
 
-# Install ca-certificates for HTTPS support if your application makes external calls
-RUN apk add --no-cache ca-certificates
+#############################
+# 2️⃣ Stage de runtime      #
+#############################
+FROM gcr.io/distroless/base-debian12:latest AS runtime
 
+# Etiquetas OCI recomendadas
+LABEL org.opencontainers.image.title="yt‑dl" \
+      org.opencontainers.image.description="Microservicio para descarga y gestión de vídeos" \
+      org.opencontainers.image.version=$VERSION \
+      org.opencontainers.image.revision=$COMMIT \
+      org.opencontainers.image.created=$BUILD_DATE \
+      org.opencontainers.image.url="https://github.com/tu‑org/yt‑dl"
+
+# Usuario no‑root distroless
+USER 65532:65532
 WORKDIR /app
 
-# Copy the built binary from the builder stage
-COPY --from=builder /app/yt_dl .
+# Copiamos solo lo necesario
+COPY --from=builder /out/yt-dl .
+# Si static/ y templates/ NO se incrustaron vía embed, descomenta:
+# COPY static ./static
+# COPY templates ./templates
 
-# Expose the port your Go application listens on (e.g., for a web server)
 EXPOSE 9191
 
-# Command to run the application when the container starts
-CMD ["/yt_dl"]
+# HEALTHCHECK sencillo (ajusta a tu endpoint)
+#HEALTHCHECK --interval=30s --timeout=3s \
+#  CMD [ "wget", "--spider", "-qO-", "http://127.0.0.1:9191/healthz" ]
+
+ENTRYPOINT ["./yt-dl"]
