@@ -28,7 +28,7 @@ WORKDIR /app
 COPY --from=builder /app/yt_dl .
 
 # Expose the port your Go application listens on (e.g., for a web server)
-EXPOSE 9191 #Adjust to your applications port
+EXPOSE 9191
 
 # Command to run the application when the container starts
 CMD ["./yt_dl"]
